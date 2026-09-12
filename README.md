@@ -1,6 +1,6 @@
-# CLI Chat
+# VikingTalk
 
-A production-ready, terminal-based online chat application in Python. One device runs the server; other devices connect as clients over TCP and chat in real time.
+A terminal-based chat application in Python. One device runs the server; other devices connect as clients over TCP and chat in real time.
 
 ## Features
 
@@ -9,15 +9,17 @@ A production-ready, terminal-based online chat application in Python. One device
 - Private messages between users
 - SQLite message history (last 50 messages on channel join)
 - Colored terminal UI with non-blocking input
-- Asyncio server supporting 100+ concurrent clients
+- Asyncio server for concurrent clients
 - Heartbeat keep-alive and graceful shutdown
+- Automatic client reconnect with exponential backoff
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- Same Wi-Fi network (for multi-device chat)
+- `pip`
+- Same local network for multi-device chat
 
 ---
 
@@ -26,10 +28,11 @@ A production-ready, terminal-based online chat application in Python. One device
 ### 1. Install dependencies
 
 ```bash
+git clone https://github.com/ubbelothbrok/CLI_chatting.git
 cd CLI_chatting
 python3 -m venv .venv
 source .venv/bin/activate          # macOS/Linux
-# .venv\Scripts\activate           # Windows
+# .venv\Scripts\activate           # Windows PowerShell
 
 pip install -r requirements.txt
 ```
@@ -83,10 +86,11 @@ Use this when one Mac/PC hosts the server and phones/laptops/other PCs connect a
    python client.py 10.33.138.229 5555
    ```
 
-   If it is not shown, find your IP on macOS:
+   If it is not shown, find your host IP with one of these commands:
 
    ```bash
-   ipconfig getifaddr en0
+   hostname -I                 # Linux
+   ipconfig getifaddr en0      # macOS
    ```
 
 ### On each other device (client machines)
@@ -101,7 +105,7 @@ Use this when one Mac/PC hosts the server and phones/laptops/other PCs connect a
 
    Replace `10.33.138.229` with your host machine's actual IP.
 
-4. Register and log in with a unique username:
+4. Register and log in with a unique username. User accounts and message history are stored in the server's `chat.db` file:
 
    ```text
    /register bob secret1
@@ -201,7 +205,7 @@ CLI_chatting/
 ├── config.py           # Host, port, limits, heartbeat
 ├── test_concurrent.py  # Multi-client smoke test
 ├── requirements.txt    # Python dependencies
-├── chat.db             # SQLite database (created at runtime)
+├── chat.db             # SQLite database (created and updated at runtime)
 └── README.md           # This file
 ```
 
@@ -219,6 +223,9 @@ Edit `config.py` to change defaults:
 | `HISTORY_DEFAULT_LIMIT` | `50` | Messages sent on channel join |
 | `HEARTBEAT_INTERVAL` | `30` | Seconds between pings |
 | `HEARTBEAT_TIMEOUT` | `60` | Disconnect if no pong within this time |
+| `RECONNECT_BASE_DELAY` | `1.0` | Initial client reconnect delay in seconds |
+| `RECONNECT_MAX_DELAY` | `30.0` | Maximum client reconnect delay in seconds |
+| `RECONNECT_MAX_ATTEMPTS` | `8` | Maximum automatic reconnect attempts |
 
 ### Local-only mode
 
@@ -256,13 +263,13 @@ Arguments: `python server.py [host] [port]` and `python client.py [host] [port]`
 
 ## Testing with Multiple Clients
 
-With the server already running:
+Start the server in one terminal, then run the smoke test in another:
 
 ```bash
-python test_concurrent.py 127.0.0.1 5555 5
+python3 test_concurrent.py 127.0.0.1 5555 5
 ```
 
-This spawns 5 bot clients that register, log in, send messages, and log out.
+The optional arguments are `[host] [port] [num_clients]`; the default is the configured host and port with 5 clients. The test registers bots, logs them in, sends messages, checks broadcasts, and exits with a non-zero status if any client fails.
 
 For manual testing, open several terminals and run `python client.py` in each.
 
@@ -309,6 +316,7 @@ Example frame:
 - Passwords are hashed with bcrypt; never stored in plaintext.
 - This app is intended for **local/LAN use**. Do not expose port 5555 to the public internet without TLS and additional hardening.
 - There is no encryption on the wire; messages travel as plain TCP on your network.
+- Keep `chat.db` private: it contains password hashes, usernames, and message history.
 
 ---
 
