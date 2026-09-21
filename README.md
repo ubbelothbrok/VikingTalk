@@ -27,13 +27,21 @@ A terminal-based chat application in Python. One device runs the server; other d
 
 ### 1. Install dependencies
 
+**macOS/Linux:**
 ```bash
 git clone https://github.com/ubbelothbrok/CLI_chatting.git
 cd CLI_chatting
 python3 -m venv .venv
-source .venv/bin/activate          # macOS/Linux
-# .venv\Scripts\activate           # Windows PowerShell
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
+**Windows:**
+```powershell
+git clone https://github.com/ubbelothbrok/CLI_chatting.git
+cd CLI_chatting
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
@@ -52,8 +60,15 @@ Other devices on your Wi-Fi can connect with:  python client.py <LAN-IP> 5555
 
 ### 3. Start a client (new terminal)
 
+**macOS/Linux:**
 ```bash
 source .venv/bin/activate
+python client.py
+```
+
+**Windows:**
+```powershell
+.venv\Scripts\activate
 python client.py
 ```
 
@@ -88,9 +103,19 @@ Use this when one Mac/PC hosts the server and phones/laptops/other PCs connect a
 
    If it is not shown, find your host IP with one of these commands:
 
+   **Linux:**
    ```bash
-   hostname -I                 # Linux
-   ipconfig getifaddr en0      # macOS
+   hostname -I
+   ```
+
+   **macOS:**
+   ```bash
+   ipconfig getifaddr en0
+   ```
+
+   **Windows:**
+   ```powershell
+   ipconfig
    ```
 
 ### On each other device (client machines)
