@@ -47,7 +47,17 @@ pip install -r requirements.txt
 
 ### 2. Start the server
 
+**macOS/Linux:**
 ```bash
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 server.py
+```
+
+**Windows:**
+```powershell
+.venv\Scripts\activate
+pip install -r requirements.txt
 python server.py
 ```
 
@@ -63,7 +73,7 @@ Other devices on your Wi-Fi can connect with:  python client.py <LAN-IP> 5555
 **macOS/Linux:**
 ```bash
 source .venv/bin/activate
-python client.py
+python3 client.py
 ```
 
 **Windows:**
@@ -121,10 +131,20 @@ Use this when one Mac/PC hosts the server and phones/laptops/other PCs connect a
 ### On each other device (client machines)
 
 1. Copy this project folder to the device (or clone it).
-2. Install dependencies (same as Quick Start).
+2. Set up the virtual environment (if not already done).
 3. Connect using the **host's LAN IP**, not `127.0.0.1`:
 
+   **macOS/Linux:**
    ```bash
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   python3 client.py 10.33.138.229 5555
+   ```
+
+   **Windows:**
+   ```powershell
+   .venv\Scripts\activate
+   pip install -r requirements.txt
    python client.py 10.33.138.229 5555
    ```
 
