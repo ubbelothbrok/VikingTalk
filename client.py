@@ -302,8 +302,6 @@ class ChatClient:
                 if ch in ("\n", "\r"):
                     line = self._input_buffer
                     self._input_buffer = ""
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
                     await self._stdin_queue.put(line)
                     self._redraw_prompt()
                 elif ch in ("\x7f", "\b"):  # backspace
