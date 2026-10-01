@@ -12,6 +12,7 @@ from typing import Any
 
 import config
 from database import Database, is_valid_name
+from discovery import guess_lan_ip, start_responder
 from protocol import (
     AUTH_REQUEST,
     AUTH_RESPONSE,
@@ -33,18 +34,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("chat.server")
-
-
-def _guess_lan_ip() -> str | None:
-    """Best-effort LAN IP for connection hints (does not change bind address)."""
-    import socket
-
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-    except OSError:
-        return None
 
 
 def _loop_time() -> float:
@@ -83,6 +72,7 @@ class ChatServer:
         self.channels: dict[str, set[str]] = {config.DEFAULT_CHANNEL: set()}
         self._server: asyncio.Server | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._discovery = None
         self._lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -92,10 +82,22 @@ class ChatServer:
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         addrs = ", ".join(str(s.getsockname()) for s in self._server.sockets or [])
         log.info("Chat server listening on %s", addrs)
-        lan_hint = _guess_lan_ip()
+        try:
+            self._discovery = await start_responder(self.port, self.host)
+            log.info("LAN discovery enabled on UDP port %s", config.DISCOVERY_PORT)
+        except OSError as exc:
+            log.warning(
+                "LAN discovery unavailable (%s); clients must enter the IP manually.", exc
+            )
+        lan_hint = guess_lan_ip()
         if self.host in ("0.0.0.0", "") and lan_hint:
+            log.info("Server LAN IP: %s  (port %s)", lan_hint, self.port)
             log.info(
-                "Other devices on your Wi-Fi can connect with:  python client.py %s %s",
+                "Other devices on the same network: run the start script and pick "
+                "'Join', or connect manually with:  start.bat client %s %s  (Windows)  "
+                "or  ./start.sh client %s %s  (macOS/Linux)",
+                lan_hint,
+                self.port,
                 lan_hint,
                 self.port,
             )
@@ -104,6 +106,8 @@ class ChatServer:
 
     async def shutdown(self) -> None:
         log.info("Shutting down…")
+        if self._discovery is not None:
+            self._discovery.close()
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             try:
@@ -754,11 +758,19 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
-            # Windows
-            signal.signal(sig, lambda *_: stop.set())
+            # Windows: no loop signal handlers; hop back onto the loop thread
+            signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
 
     serve_task = asyncio.create_task(server.start())
-    await stop.wait()
+    stop_task = asyncio.create_task(stop.wait())
+    await asyncio.wait({serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+    stop_task.cancel()
+    if serve_task.done() and not serve_task.cancelled() and serve_task.exception():
+        exc = serve_task.exception()
+        log.error("Could not start server on %s:%s: %s", host, port, exc)
+        log.error("Is another server already running? Try a different port.")
+        server.db.close()
+        sys.exit(1)
     serve_task.cancel()
     try:
         await serve_task

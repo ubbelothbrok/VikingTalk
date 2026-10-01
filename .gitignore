@@ -1,0 +1,12 @@
+# Virtual environments are OS-specific; start.py creates one per OS on first run
+.venv/
+.venv-*/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Runtime data: user accounts, password hashes and chat history stay local
+chat.db
+*.db-journal
+server.log

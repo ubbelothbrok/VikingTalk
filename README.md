@@ -1,177 +1,110 @@
 # VikingTalk
 
-A terminal-based chat application in Python. One device runs the server; other devices connect as clients over TCP and chat in real time.
+A terminal chat app in Python for **Windows, macOS and Linux**. One device hosts the chat; every other device on the same Wi-Fi/LAN joins it and everyone chats in real time, whatever operating system they use.
 
 ## Features
 
+- Works the same on Windows, macOS and Linux, and they can all chat with each other
+- One-command start: the launcher sets up its own Python environment on first run
+- Finds the server on your network automatically (no IP typing needed)
 - User registration and login (bcrypt password hashing)
-- Public channels with join/create/leave
-- Private messages between users
+- Public channels with join/create/leave, plus private messages
 - SQLite message history (last 50 messages on channel join)
-- Colored terminal UI with non-blocking input
-- Asyncio server for concurrent clients
-- Heartbeat keep-alive and graceful shutdown
-- Automatic client reconnect with exponential backoff
+- Colored terminal UI that keeps your half-typed message when new messages arrive
+- Heartbeat keep-alive, graceful shutdown, automatic client reconnect
 
 ---
 
 ## Requirements
 
-- Python 3.10+
-- `pip`
-- Same local network for multi-device chat
+- **Python 3.9 or newer**, which is the only thing you install yourself:
+  - **Windows:** <https://www.python.org/downloads/>. Tick **"Add python.exe to PATH"** in the installer.
+  - **macOS:** <https://www.python.org/downloads/> or `brew install python`
+  - **Linux (Debian/Ubuntu):** `sudo apt install python3 python3-venv`
+- Internet the **first** time you start it on each device (to download 2 small packages)
+- All devices on the **same Wi-Fi / LAN** to chat between devices
 
 ---
 
-## Quick Start (Single Machine)
+## Quick Start
 
-### 1. Install dependencies
+### 1. Get the code
 
-**macOS/Linux:**
 ```bash
 git clone https://github.com/ubbelothbrok/CLI_chatting.git
 cd CLI_chatting
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 ```
 
-**Windows:**
-```powershell
-git clone https://github.com/ubbelothbrok/CLI_chatting.git
-cd CLI_chatting
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
+### 2. Start it
 
-### 2. Start the server
+| OS | Command |
+|----|---------|
+| **Windows** | `start.bat` (or double-click `start.bat` in Explorer) |
+| **macOS** | `./start.sh` (or double-click `start.command` in Finder) |
+| **Linux** | `./start.sh` |
 
-**macOS/Linux:**
-```bash
-source .venv/bin/activate
-pip install -r requirements.txt
-python3 server.py
-```
+The first run creates a virtual environment for that OS (`.venv-windows`, `.venv-macos` or `.venv-linux`) and installs the dependencies. Later runs start instantly. You never need to create or activate a venv yourself.
 
-**Windows:**
-```powershell
-.venv\Scripts\activate
-pip install -r requirements.txt
-python server.py
-```
-
-You should see:
+You'll see a menu:
 
 ```text
-Chat server listening on ('0.0.0.0', 5555)
-Other devices on your Wi-Fi can connect with:  python client.py <LAN-IP> 5555
+  1) Host a chat AND join it   (do this on ONE device)
+  2) Join a chat on the network (all other devices)
+  3) Run server only
+  4) Self-test
 ```
 
-### 3. Start a client (new terminal)
+### 3. Chat across devices
 
-**macOS/Linux:**
-```bash
-source .venv/bin/activate
-python3 client.py
-```
+1. On **one** device choose **1**. It starts the server and opens a chat window.
+2. On **every other** device (any OS) choose **2**. It finds the server on the network by itself.
+3. Everyone registers and logs in, then just types:
 
-**Windows:**
-```powershell
-.venv\Scripts\activate
-python client.py
-```
+   ```text
+   /register alice secret1
+   /login alice secret1
+   Hello everyone!
+   ```
 
-### 4. Register and log in
+Closing the host's chat (`/quit`) also stops the server.
 
-```text
-/register alice secret1
-/login alice secret1
-```
-
-Then type normally to chat in `#general`.
+> **Why isn't there a `.venv` in the repo?** A virtual environment contains compiled files for one OS and one Python install, so a Linux `.venv` cannot run on Windows or macOS. The start scripts build the right one on each device automatically, and `.gitignore` keeps them out of git.
 
 ---
 
-## Multi-Device Setup (One Device Talks to Others)
+## Command-Line Options
 
-Use this when one Mac/PC hosts the server and phones/laptops/other PCs connect as clients.
+The menu is optional. You can pass a mode directly. On Windows replace `./start.sh` with `start.bat` (typing just `start` runs a different, built-in Windows command):
 
-### On the host device (server machine)
+```bash
+./start.sh host                      # server in background + chat (port 5555)
+./start.sh client                    # join: find the server automatically
+./start.sh client 192.168.1.20       # join a specific server IP
+./start.sh client 192.168.1.20 6000  # ...on a specific port
+./start.sh server                    # server only (e.g. an always-on machine)
+./start.sh server 0.0.0.0 6000       # server on a custom host/port
+./start.sh test                      # self-test: temporary server + 5 bot clients
+```
 
-1. Keep the server running:
+---
 
-   ```bash
-   python server.py
-   ```
+## If Devices Can't Find Each Other
 
-2. Note the **LAN IP** printed in the server log, for example:
+Automatic discovery uses a UDP broadcast on port **5556**, and chat uses TCP port **5555**. If option 2 says *"No server found"*:
 
-   ```text
-   python client.py 10.33.138.229 5555
-   ```
-
-   If it is not shown, find your host IP with one of these commands:
-
-   **Linux:**
-   ```bash
-   hostname -I
-   ```
-
-   **macOS:**
-   ```bash
-   ipconfig getifaddr en0
-   ```
-
-   **Windows:**
-   ```powershell
-   ipconfig
-   ```
-
-### On each other device (client machines)
-
-1. Copy this project folder to the device (or clone it).
-2. Set up the virtual environment (if not already done).
-3. Connect using the **host's LAN IP**, not `127.0.0.1`:
-
-   **macOS/Linux:**
-   ```bash
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   python3 client.py 10.33.138.229 5555
-   ```
-
-   **Windows:**
-   ```powershell
-   .venv\Scripts\activate
-   pip install -r requirements.txt
-   python client.py 10.33.138.229 5555
-   ```
-
-   Replace `10.33.138.229` with your host machine's actual IP.
-
-4. Register and log in with a unique username. User accounts and message history are stored in the server's `chat.db` file:
+1. Make sure both devices are on the **same Wi-Fi** (guest networks often block device-to-device traffic).
+2. Connect by IP instead. The host prints its address when it starts:
 
    ```text
-   /register bob secret1
-   /login bob secret1
+   Server LAN IP: 192.168.1.20  (port 5555)
    ```
 
-### Important rules
-
-| Do | Don't |
-|----|-------|
-| Use the host's LAN IP on other devices | Use `127.0.0.1` on other devices |
-| Keep all devices on the same Wi-Fi | Expect it to work across different networks without extra setup |
-| Restart the server after changing `config.py` | Assume old server settings apply |
-
-### If connection fails
-
-1. Confirm the server is running on the host.
-2. Confirm both devices are on the same Wi-Fi.
-3. On macOS, allow Python through the firewall:
-   **System Settings → Network → Firewall → Options → allow Python**
-4. Try pinging the host IP from the client device.
+   Then on the other device run `start.bat client 192.168.1.20` (Windows) or `./start.sh client 192.168.1.20` (macOS/Linux).
+3. Allow the server through the **firewall on the host device**:
+   - **Windows:** when the "Windows Defender Firewall" popup appears, tick **Private networks** and click *Allow*. If you missed it: *Windows Security → Firewall → Allow an app → Python*.
+   - **macOS:** click *Allow* on the "accept incoming connections" popup, or *System Settings → Network → Firewall → Options → allow Python*.
+   - **Linux (ufw):** `sudo ufw allow 5555/tcp && sudo ufw allow 5556/udp`
+4. Find the host IP manually if needed: `ipconfig` (Windows), `ipconfig getifaddr en0` (macOS), `hostname -I` (Linux).
 
 ---
 
@@ -243,80 +176,40 @@ Prompt format:
 
 ```text
 CLI_chatting/
+├── start.py            # Cross-platform launcher: builds the per-OS venv, menu, modes
+├── start.bat           # Windows wrapper (double-click)
+├── start.sh            # macOS/Linux wrapper
+├── start.command       # macOS Finder double-click wrapper
 ├── server.py           # Asyncio TCP server
-├── client.py           # Terminal client with prompt redraw
+├── client.py           # Terminal client (Windows + Unix keyboard handling)
+├── discovery.py        # UDP broadcast server discovery on the LAN
 ├── protocol.py         # Length-prefixed JSON framing
 ├── database.py         # SQLite + bcrypt credentials
-├── config.py           # Host, port, limits, heartbeat
-├── test_concurrent.py  # Multi-client smoke test
-├── requirements.txt    # Python dependencies
-├── chat.db             # SQLite database (created and updated at runtime)
-└── README.md           # This file
+├── config.py           # Host, ports, limits, heartbeat
+├── test_concurrent.py  # Multi-client test (public + private messages, discovery)
+└── requirements.txt    # Python dependencies (colorama, bcrypt)
 ```
+
+Created at runtime and **not** committed: `.venv-<os>/`, `chat.db` (accounts and history), `server.log`.
 
 ---
 
 ## Configuration
 
-Edit `config.py` to change defaults:
+Edit `config.py` to change defaults (restart the server afterwards):
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `HOST` | `0.0.0.0` | Server bind address (`0.0.0.0` = all interfaces) |
-| `PORT` | `5555` | Server port |
+| `HOST` | `0.0.0.0` | Server bind address (`0.0.0.0` = reachable from the LAN, `127.0.0.1` = this machine only) |
+| `PORT` | `5555` | Chat TCP port |
+| `DISCOVERY_PORT` | `5556` | UDP port for automatic discovery |
 | `DEFAULT_CHANNEL` | `general` | Channel users join on login |
 | `HISTORY_DEFAULT_LIMIT` | `50` | Messages sent on channel join |
 | `HEARTBEAT_INTERVAL` | `30` | Seconds between pings |
 | `HEARTBEAT_TIMEOUT` | `60` | Disconnect if no pong within this time |
-| `RECONNECT_BASE_DELAY` | `1.0` | Initial client reconnect delay in seconds |
-| `RECONNECT_MAX_DELAY` | `30.0` | Maximum client reconnect delay in seconds |
 | `RECONNECT_MAX_ATTEMPTS` | `8` | Maximum automatic reconnect attempts |
 
-### Local-only mode
-
-To restrict the server to this machine only, change in `config.py`:
-
-```python
-HOST = "127.0.0.1"
-```
-
-Then clients on the same machine connect with:
-
-```bash
-python client.py
-```
-
----
-
-## Custom Host and Port
-
-**Server:**
-
-```bash
-python server.py 0.0.0.0 5555
-```
-
-**Client:**
-
-```bash
-python client.py 10.33.138.229 5555
-```
-
-Arguments: `python server.py [host] [port]` and `python client.py [host] [port]`.
-
----
-
-## Testing with Multiple Clients
-
-Start the server in one terminal, then run the smoke test in another:
-
-```bash
-python3 test_concurrent.py 127.0.0.1 5555 5
-```
-
-The optional arguments are `[host] [port] [num_clients]`; the default is the configured host and port with 5 clients. The test registers bots, logs them in, sends messages, checks broadcasts, and exits with a non-zero status if any client fails.
-
-For manual testing, open several terminals and run `python client.py` in each.
+The environment variables `VIKINGTALK_PORT`, `VIKINGTALK_DISCOVERY_PORT` and `VIKINGTALK_DB` override the port, discovery port and database path.
 
 ---
 
@@ -346,13 +239,16 @@ Example frame:
 
 | Problem | Solution |
 |---------|----------|
-| `Connection failed` | Start the server first; check IP and port |
+| `Python 3 was not found` | Install Python (see Requirements). On Windows tick "Add python.exe to PATH". |
+| `Could not create the virtual environment` (Linux) | `sudo apt install python3-venv`, then start again |
+| `Installing dependencies failed` | The first run needs internet; connect and start again |
+| `No server found automatically` | See "If Devices Can't Find Each Other" above |
+| `Could not start server ... address already in use` | A server is already running, or use another port: `./start.sh server 0.0.0.0 6000` (`start.bat` on Windows) |
 | `User already logged in` | That username is active elsewhere; use `/logout` or pick another name |
 | `Invalid username or password` | Register first with `/register`, then `/login` |
-| `User 'X' not found` | Target user is offline or username is wrong |
 | `Channel does not exist` | Create it with `/create <name>` first |
-| Other device can't connect | Same Wi-Fi, correct LAN IP, firewall allows Python |
-| Port already in use | Stop old server or change `PORT` in `config.py` |
+| `./start.sh: Permission denied` | `chmod +x start.sh start.command` |
+| Something broke after a Python upgrade | Delete the `.venv-<os>` folder; the next start rebuilds it |
 
 ---
 

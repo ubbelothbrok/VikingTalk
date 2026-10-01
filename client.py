@@ -4,13 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from typing import Any
+
+# Never crash on characters the local console can't display (e.g. emoji on a
+# Windows code page); show a replacement character instead.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 try:
     import colorama
     from colorama import Fore, Style
 
-    colorama.init()
+    if hasattr(colorama, "just_fix_windows_console"):
+        colorama.just_fix_windows_console()  # enable ANSI on Windows, no-op elsewhere
+    else:
+        colorama.init()
 except ImportError:  # pragma: no cover
     class _Fore:
         CYAN = YELLOW = GREEN = WHITE = RED = MAGENTA = ""
@@ -22,6 +34,7 @@ except ImportError:  # pragma: no cover
     Style = _Style()  # type: ignore
 
 import config
+from discovery import find_servers
 from protocol import (
     AUTH_REQUEST,
     AUTH_RESPONSE,
@@ -44,7 +57,9 @@ _SHOW_CURSOR = "\033[?25h"
 
 
 class ChatClient:
-    def __init__(self, host: str = config.HOST, port: int = config.PORT) -> None:
+    def __init__(
+        self, host: str = config.CLIENT_FALLBACK_HOST, port: int = config.PORT
+    ) -> None:
         self.host = host
         self.port = port
         self.reader: asyncio.StreamReader | None = None
@@ -262,67 +277,90 @@ class ChatClient:
 
     # --- Input ---
 
-    async def _stdin_reader(self) -> None:
+    def _start_input_thread(self) -> None:
         """
-        Read stdin character-by-character when a TTY is available so we can
-        preserve partial input when server messages arrive. Falls back to
-        line-buffered reads otherwise.
+        Read the keyboard on a daemon thread and hand keys to the event loop.
+        Character-at-a-time on a terminal (so partial input survives incoming
+        messages), line-at-a-time otherwise. A daemon thread never blocks exit.
         """
         loop = asyncio.get_running_loop()
-        if sys.stdin.isatty() and sys.platform != "win32":
-            await self._tty_input_loop(loop)
-        else:
-            await self._line_input_loop(loop)
+        is_tty = sys.stdin.isatty()
 
-    async def _line_input_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        while self.running:
-            try:
-                line = await loop.run_in_executor(None, sys.stdin.readline)
-            except Exception:
-                break
-            if line == "":
-                await self._stdin_queue.put(None)
-                break
-            await self._stdin_queue.put(line.rstrip("\n\r"))
+        if is_tty and sys.platform != "win32":
+            import termios
+            import tty
 
-    async def _tty_input_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        import termios
-        import tty
-
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
+            fd = sys.stdin.fileno()
+            self._saved_tty = (fd, termios.tcgetattr(fd))
             tty.setcbreak(fd)
+
+        def post(callback, value) -> None:
+            try:
+                loop.call_soon_threadsafe(callback, value)
+            except RuntimeError:  # loop already closed
+                pass
+
+        def worker() -> None:
+            try:
+                if is_tty and sys.platform == "win32":
+                    import msvcrt
+
+                    while True:
+                        ch = msvcrt.getwch()
+                        if ch in ("\x00", "\xe0"):  # arrow/function key prefix
+                            msvcrt.getwch()
+                            continue
+                        post(self._on_key, ch)
+                elif is_tty:
+                    while True:
+                        ch = sys.stdin.read(1)
+                        if not ch:
+                            break
+                        post(self._on_key, ch)
+                else:
+                    for line in sys.stdin:
+                        post(self._stdin_queue.put_nowait, line.rstrip("\r\n"))
+            except Exception:
+                pass
+            post(self._stdin_queue.put_nowait, None)
+
+        threading.Thread(target=worker, name="stdin", daemon=True).start()
+        if is_tty:
             self._redraw_prompt()
-            while self.running:
-                ch = await loop.run_in_executor(None, sys.stdin.read, 1)
-                if not ch:
-                    await self._stdin_queue.put(None)
-                    break
-                if ch in ("\n", "\r"):
-                    line = self._input_buffer
-                    self._input_buffer = ""
-                    await self._stdin_queue.put(line)
-                    self._redraw_prompt()
-                elif ch in ("\x7f", "\b"):  # backspace
-                    if self._input_buffer:
-                        self._input_buffer = self._input_buffer[:-1]
-                        self._redraw_prompt()
-                elif ch == "\x03":  # Ctrl+C
-                    await self._stdin_queue.put("/quit")
-                elif ch == "\x04":  # Ctrl+D
-                    await self._stdin_queue.put(None)
-                    break
-                elif ch == "\x15":  # Ctrl+U clear line
-                    self._input_buffer = ""
-                    self._redraw_prompt()
-                elif ord(ch) >= 32:
-                    self._input_buffer += ch
-                    sys.stdout.write(ch)
-                    sys.stdout.flush()
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            sys.stdout.write(_SHOW_CURSOR)
+
+    def _restore_terminal(self) -> None:
+        saved = getattr(self, "_saved_tty", None)
+        if saved:
+            import termios
+
+            termios.tcsetattr(saved[0], termios.TCSADRAIN, saved[1])
+            self._saved_tty = None
+        sys.stdout.write(_SHOW_CURSOR)
+        sys.stdout.flush()
+
+    def _on_key(self, ch: str) -> None:
+        """Handle one keypress (runs on the event loop thread)."""
+        if ch in ("\n", "\r"):
+            line = self._input_buffer
+            self._input_buffer = ""
+            self._stdin_queue.put_nowait(line)
+            self._redraw_prompt()
+        elif ch in ("\x7f", "\b"):  # backspace (Unix sends DEL, Windows sends BS)
+            if self._input_buffer:
+                self._input_buffer = self._input_buffer[:-1]
+                self._redraw_prompt()
+        elif ch == "\x03":  # Ctrl+C
+            self._stdin_queue.put_nowait("/quit")
+        elif ch in ("\x04", "\x1a"):  # Ctrl+D (Unix) / Ctrl+Z (Windows)
+            self._stdin_queue.put_nowait(None)
+        elif ch == "\x15":  # Ctrl+U clear line
+            self._input_buffer = ""
+            self._redraw_prompt()
+        elif ch == "\x1b":  # Escape (start of arrow-key sequences on Unix): ignore
+            pass
+        elif ch.isprintable():
+            self._input_buffer += ch
+            sys.stdout.write(ch)
             sys.stdout.flush()
 
     async def _process_input_line(self, line: str) -> None:
@@ -440,7 +478,7 @@ class ChatClient:
                 return
 
         reader_task = asyncio.create_task(self._reader_loop())
-        stdin_task = asyncio.create_task(self._stdin_reader())
+        self._start_input_thread()
 
         try:
             while self.running:
@@ -464,23 +502,45 @@ class ChatClient:
         finally:
             self.running = False
             await self.disconnect(send_logout=True)
-            stdin_task.cancel()
+            self._restore_terminal()
             reader_task.cancel()
-            for t in (stdin_task, reader_task):
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
+            try:
+                await reader_task
+            except asyncio.CancelledError:
+                pass
             print()
 
 
+def _choose_server() -> tuple[str, int]:
+    """Find a server on the LAN; ask the user if there are several."""
+    print(f"{Fore.CYAN}Searching the local network for a VikingTalk server…{Style.RESET_ALL}")
+    servers = find_servers()
+    if not servers:
+        print(
+            f"{Fore.YELLOW}No server found automatically. "
+            f"Trying {config.CLIENT_FALLBACK_HOST}:{config.PORT}.\n"
+            f"If the server is on another device, run: start.bat client <server-ip> "
+            f"(Windows) or ./start.sh client <server-ip> (macOS/Linux)"
+            f"{Style.RESET_ALL}"
+        )
+        return config.CLIENT_FALLBACK_HOST, config.PORT
+    if len(servers) == 1:
+        return servers[0]
+    print("Found several servers:")
+    for i, (ip, port) in enumerate(servers, 1):
+        print(f"  {i}) {ip}:{port}")
+    while True:
+        choice = input(f"Pick one [1-{len(servers)}]: ").strip() or "1"
+        if choice.isdigit() and 1 <= int(choice) <= len(servers):
+            return servers[int(choice) - 1]
+
+
 async def main() -> None:
-    host = config.HOST
-    port = config.PORT
     if len(sys.argv) >= 2:
         host = sys.argv[1]
-    if len(sys.argv) >= 3:
-        port = int(sys.argv[2])
+        port = int(sys.argv[2]) if len(sys.argv) >= 3 else config.PORT
+    else:
+        host, port = await asyncio.to_thread(_choose_server)
     client = ChatClient(host, port)
     await client.run()
 
