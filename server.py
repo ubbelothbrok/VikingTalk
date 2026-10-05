@@ -94,6 +94,9 @@ class ChatServer:
         self._heartbeat_task: asyncio.Task | None = None
         self._discovery = None
         self._lock = asyncio.Lock()
+        # LAN address of this machine, used to rewrite loopback peer IPs so a
+        # client on another device gets an address it can actually dial.
+        self._lan_ip: str | None = None
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(
@@ -110,6 +113,7 @@ class ChatServer:
                 "LAN discovery unavailable (%s); clients must enter the IP manually.", exc
             )
         lan_hint = guess_lan_ip()
+        self._lan_ip = lan_hint
         if self.host in ("0.0.0.0", "") and lan_hint:
             log.info("Server LAN IP: %s  (port %s)", lan_hint, self.port)
             log.info(
@@ -844,6 +848,23 @@ class ChatServer:
             )
         return offer
 
+    def _dialable_ip(self, session: "ClientSession") -> str:
+        """
+        The address another device should use to reach `session`.
+
+        A client running on the same machine as the server connects over
+        loopback, so its peer IP is 127.0.0.1 -- useless to a peer on a
+        different device, which would dial itself. Substitute this machine's
+        LAN IP instead; it also works for same-machine transfers, since the
+        receiver listens on 0.0.0.0.
+        """
+        ip = session.peer_ip
+        if ip.startswith("::ffff:"):
+            ip = ip[len("::ffff:") :]
+        if ip.startswith("127.") or ip in ("::1", "", "0.0.0.0"):
+            return self._lan_ip or guess_lan_ip() or ip
+        return ip
+
     async def _handle_file_accept(
         self, session: ClientSession, payload: dict[str, Any]
     ) -> None:
@@ -875,13 +896,14 @@ class ChatServer:
             )
             return
 
+        host = self._dialable_ip(session)
         await self._send(
             sender,
             FILE_ACCEPT,
             {
                 "transfer_id": offer.transfer_id,
                 "from": offer.recipient,
-                "host": session.peer_ip,
+                "host": host,
                 "port": port,
                 "token": token,
                 "filename": offer.filename,
@@ -892,7 +914,7 @@ class ChatServer:
             "Transfer %s accepted: %s is listening on %s:%s",
             offer.transfer_id,
             offer.recipient,
-            session.peer_ip,
+            host,
             port,
         )
 
