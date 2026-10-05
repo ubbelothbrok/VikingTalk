@@ -13,11 +13,16 @@ from typing import Any
 import config
 from database import Database, is_valid_name
 from discovery import guess_lan_ip, start_responder
+from filetransfer import TRANSFER_ID_RE, human_size, sanitize_filename
 from protocol import (
     AUTH_REQUEST,
     AUTH_RESPONSE,
     CMD_REQUEST,
     CMD_RESPONSE,
+    FILE_ACCEPT,
+    FILE_DECLINE,
+    FILE_OFFER,
+    FILE_RESULT,
     HISTORY_RESPONSE,
     PING,
     PONG,
@@ -49,6 +54,7 @@ class ClientSession:
     last_activity: float = 0.0
     last_pong: float = 0.0
     addr: str = ""
+    peer_ip: str = ""
 
     def __hash__(self) -> int:
         return id(self)
@@ -57,6 +63,18 @@ class ClientSession:
         now = _loop_time()
         self.last_activity = now
         self.last_pong = now
+
+
+@dataclass
+class FileOffer:
+    """A pending peer-to-peer transfer the server is brokering."""
+
+    transfer_id: str
+    sender: str
+    recipient: str
+    filename: str
+    size: int
+    created: float
 
 
 class ChatServer:
@@ -70,6 +88,8 @@ class ChatServer:
         self.connections: set[ClientSession] = set()
         # channel -> set of usernames
         self.channels: dict[str, set[str]] = {config.DEFAULT_CHANNEL: set()}
+        # transfer_id -> FileOffer (brokered, never carries file bytes)
+        self.offers: dict[str, FileOffer] = {}
         self._server: asyncio.Server | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._discovery = None
@@ -150,6 +170,7 @@ class ChatServer:
             reader=reader,
             writer=writer,
             addr=addr,
+            peer_ip=peer[0] if peer else "",
             last_activity=now,
             last_pong=now,
         )
@@ -211,6 +232,7 @@ class ChatServer:
                 else:
                     username = None  # already logged out / replaced
         if username:
+            await self._cancel_offers_for(username)
             await self._broadcast_channel(
                 channel,
                 SYSTEM_MSG,
@@ -255,6 +277,22 @@ class ChatServer:
 
         if msg_type == CMD_REQUEST:
             await self._handle_command(session, payload)
+            return
+
+        if msg_type == FILE_OFFER:
+            await self._handle_file_offer(session, payload)
+            return
+
+        if msg_type == FILE_ACCEPT:
+            await self._handle_file_accept(session, payload)
+            return
+
+        if msg_type == FILE_DECLINE:
+            await self._handle_file_decline(session, payload)
+            return
+
+        if msg_type == FILE_RESULT:
+            await self._handle_file_result(session, payload)
             return
 
         await self._send(
@@ -417,16 +455,9 @@ class ChatServer:
             )
             return
 
-        async with self._lock:
-            dest = self.sessions.get(target)
-            # case-insensitive lookup
-            if dest is None:
-                lower = target.lower()
-                for name, sess in self.sessions.items():
-                    if name.lower() == lower:
-                        dest = sess
-                        target = name
-                        break
+        dest = await self._find_session(target)
+        if dest is not None and dest.username:
+            target = dest.username
 
         if dest is None or dest.username is None:
             await self._send(
@@ -499,6 +530,7 @@ class ChatServer:
                 members.discard(username)
         session.username = None
         session.channel = config.DEFAULT_CHANNEL
+        await self._cancel_offers_for(username)
         await self._send(
             session, SYSTEM_MSG, {"content": "You have been logged out."}
         )
@@ -650,6 +682,10 @@ class ChatServer:
             "  /login <user> <pass>     Log in\n"
             "  /logout                  Log out\n"
             "  /msg <user> <text>       Private message\n"
+            "  /send <user> <path>      Send a file directly over the LAN\n"
+            "  /accept [id]             Accept an incoming file\n"
+            "  /decline [id]            Decline an incoming file\n"
+            "  /transfers               List pending/active transfers\n"
             "  /create <channel>        Create a channel\n"
             "  /join <channel>          Switch channel\n"
             "  /leave                   Return to #general\n"
@@ -672,7 +708,304 @@ class ChatServer:
         target, content = args[0], " ".join(args[1:])
         await self._handle_private(session, {"to": target, "content": content})
 
+    # --- File transfer brokering ---
+    #
+    # The server never relays file bytes. It validates an offer, tells the
+    # recipient about it, and hands the sender the recipient's LAN address
+    # once they accept; the transfer itself is a direct socket between peers.
+
+    async def _handle_file_offer(
+        self, session: ClientSession, payload: dict[str, Any]
+    ) -> None:
+        if not await self._require_login(session):
+            return
+        assert session.username is not None
+
+        transfer_id = str(payload.get("transfer_id") or "")
+        target = (payload.get("to") or "").strip()
+        filename = sanitize_filename(str(payload.get("filename") or ""))
+        try:
+            size = int(payload.get("size"))
+        except (TypeError, ValueError):
+            size = -1
+
+        if not TRANSFER_ID_RE.fullmatch(transfer_id):
+            await self._send(
+                session, SYSTEM_MSG, {"content": "Error: malformed transfer id."}
+            )
+            return
+        if not filename:
+            await self._send(
+                session, SYSTEM_MSG, {"content": "Error: unusable file name."}
+            )
+            return
+        if not 0 < size <= config.MAX_FILE_SIZE:
+            await self._send(
+                session,
+                SYSTEM_MSG,
+                {
+                    "content": (
+                        "Error: file must be between 1 byte and "
+                        f"{human_size(config.MAX_FILE_SIZE)}."
+                    )
+                },
+            )
+            return
+
+        dest = await self._find_session(target)
+        if dest is None or dest.username is None:
+            await self._send(
+                session,
+                SYSTEM_MSG,
+                {"content": f"Error: User '{target}' is not online."},
+            )
+            return
+
+        async with self._lock:
+            if transfer_id in self.offers:
+                await self._send(
+                    session,
+                    SYSTEM_MSG,
+                    {"content": "Error: that transfer id is already in use."},
+                )
+                return
+            mine = sum(
+                1 for o in self.offers.values() if o.sender == session.username
+            )
+            if mine >= config.MAX_PENDING_OFFERS_PER_USER:
+                await self._send(
+                    session,
+                    SYSTEM_MSG,
+                    {
+                        "content": (
+                            "Error: too many pending offers "
+                            f"(max {config.MAX_PENDING_OFFERS_PER_USER}). "
+                            "Wait for them to be answered."
+                        )
+                    },
+                )
+                return
+            self.offers[transfer_id] = FileOffer(
+                transfer_id=transfer_id,
+                sender=session.username,
+                recipient=dest.username,
+                filename=filename,
+                size=size,
+                created=_loop_time(),
+            )
+
+        await self._send(
+            dest,
+            FILE_OFFER,
+            {
+                "transfer_id": transfer_id,
+                "from": session.username,
+                "filename": filename,
+                "size": size,
+            },
+        )
+        await self._send(
+            session,
+            SYSTEM_MSG,
+            {
+                "content": (
+                    f"Offered '{filename}' ({human_size(size)}) to "
+                    f"@{dest.username} [{transfer_id}]. Waiting for them to accept."
+                )
+            },
+        )
+        log.info(
+            "File offer %s: %s -> %s ('%s', %s)",
+            transfer_id,
+            session.username,
+            dest.username,
+            filename,
+            human_size(size),
+        )
+
+    async def _take_offer(
+        self, session: ClientSession, payload: dict[str, Any], as_recipient: bool
+    ) -> "FileOffer | None":
+        """Pop the offer named in `payload` if this session is a party to it."""
+        transfer_id = str(payload.get("transfer_id") or "")
+        async with self._lock:
+            offer = self.offers.get(transfer_id)
+            if offer is not None:
+                party = offer.recipient if as_recipient else offer.sender
+                if party == session.username:
+                    del self.offers[transfer_id]
+                else:
+                    offer = None
+        if offer is None:
+            await self._send(
+                session,
+                SYSTEM_MSG,
+                {"content": f"Error: no pending transfer '{transfer_id}'."},
+            )
+        return offer
+
+    async def _handle_file_accept(
+        self, session: ClientSession, payload: dict[str, Any]
+    ) -> None:
+        if not await self._require_login(session):
+            return
+        offer = await self._take_offer(session, payload, as_recipient=True)
+        if offer is None:
+            return
+
+        try:
+            port = int(payload.get("port"))
+        except (TypeError, ValueError):
+            port = 0
+        token = str(payload.get("token") or "")
+        if not 0 < port <= 65535 or not token:
+            await self._send(
+                session,
+                SYSTEM_MSG,
+                {"content": "Error: invalid listening port for the transfer."},
+            )
+            return
+
+        sender = await self._find_session(offer.sender)
+        if sender is None:
+            await self._send(
+                session,
+                SYSTEM_MSG,
+                {"content": f"Error: @{offer.sender} went offline; transfer cancelled."},
+            )
+            return
+
+        await self._send(
+            sender,
+            FILE_ACCEPT,
+            {
+                "transfer_id": offer.transfer_id,
+                "from": offer.recipient,
+                "host": session.peer_ip,
+                "port": port,
+                "token": token,
+                "filename": offer.filename,
+                "size": offer.size,
+            },
+        )
+        log.info(
+            "Transfer %s accepted: %s is listening on %s:%s",
+            offer.transfer_id,
+            offer.recipient,
+            session.peer_ip,
+            port,
+        )
+
+    async def _handle_file_decline(
+        self, session: ClientSession, payload: dict[str, Any]
+    ) -> None:
+        if not await self._require_login(session):
+            return
+        offer = await self._take_offer(session, payload, as_recipient=True)
+        if offer is None:
+            return
+        sender = await self._find_session(offer.sender)
+        if sender is not None:
+            await self._send(
+                sender,
+                FILE_DECLINE,
+                {
+                    "transfer_id": offer.transfer_id,
+                    "from": offer.recipient,
+                    "filename": offer.filename,
+                },
+            )
+        await self._send(
+            session,
+            SYSTEM_MSG,
+            {"content": f"Declined '{offer.filename}' from @{offer.sender}."},
+        )
+
+    async def _handle_file_result(
+        self, session: ClientSession, payload: dict[str, Any]
+    ) -> None:
+        """A receiver reporting the outcome back to the sender."""
+        if not await self._require_login(session):
+            return
+        assert session.username is not None
+        peer = (payload.get("to") or "").strip()
+        dest = await self._find_session(peer)
+        if dest is None:
+            return
+        await self._send(
+            dest,
+            FILE_RESULT,
+            {
+                "transfer_id": str(payload.get("transfer_id") or ""),
+                "from": session.username,
+                "ok": bool(payload.get("ok")),
+                "message": str(payload.get("message") or "")[:500],
+            },
+        )
+
+    async def _cancel_offers_for(self, username: str) -> None:
+        """Drop every offer this user is a party to and tell the other side."""
+        async with self._lock:
+            doomed = [
+                o for o in self.offers.values()
+                if username in (o.sender, o.recipient)
+            ]
+            for offer in doomed:
+                self.offers.pop(offer.transfer_id, None)
+        for offer in doomed:
+            other = offer.recipient if offer.sender == username else offer.sender
+            peer = await self._find_session(other)
+            if peer is not None:
+                await self._send(
+                    peer,
+                    FILE_DECLINE,
+                    {
+                        "transfer_id": offer.transfer_id,
+                        "from": username,
+                        "filename": offer.filename,
+                        "reason": f"@{username} went offline",
+                    },
+                )
+
+    async def _expire_offers(self) -> None:
+        """Time out offers nobody answered, so ids and memory are not leaked."""
+        cutoff = _loop_time() - config.TRANSFER_OFFER_TIMEOUT
+        async with self._lock:
+            stale = [o for o in self.offers.values() if o.created < cutoff]
+            for offer in stale:
+                self.offers.pop(offer.transfer_id, None)
+        for offer in stale:
+            for name in (offer.sender, offer.recipient):
+                peer = await self._find_session(name)
+                if peer is not None:
+                    await self._send(
+                        peer,
+                        FILE_DECLINE,
+                        {
+                            "transfer_id": offer.transfer_id,
+                            "from": offer.sender,
+                            "filename": offer.filename,
+                            "reason": "offer expired",
+                        },
+                    )
+            log.info("File offer %s expired", offer.transfer_id)
+
     # --- Helpers ---
+
+    async def _find_session(self, name: str) -> ClientSession | None:
+        """Look up a logged-in session by username, case-insensitively."""
+        name = (name or "").strip()
+        if not name:
+            return None
+        async with self._lock:
+            dest = self.sessions.get(name)
+            if dest is None:
+                lower = name.lower()
+                for candidate, sess in self.sessions.items():
+                    if candidate.lower() == lower:
+                        dest = sess
+                        break
+        return dest
 
     async def _send_history(
         self,
@@ -716,6 +1049,7 @@ class ChatServer:
         try:
             while True:
                 await asyncio.sleep(config.HEARTBEAT_INTERVAL)
+                await self._expire_offers()
                 now = _loop_time()
                 async with self._lock:
                     sessions = list(self.connections)

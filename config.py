@@ -40,6 +40,21 @@ PASSWORD_MIN_LEN = 4
 PASSWORD_MAX_LEN = 128
 MESSAGE_MAX_LEN = 2000
 
+# File transfer (direct peer-to-peer; the server only brokers the handshake)
+FILE_CHUNK_SIZE = 256 * 1024
+# 8 GiB default ceiling; raise with VIKINGTALK_MAX_FILE_SIZE if you need more
+MAX_FILE_SIZE = int(os.environ.get("VIKINGTALK_MAX_FILE_SIZE", str(8 * 1024**3)))
+DOWNLOADS_DIR = os.environ.get(
+    "VIKINGTALK_DOWNLOADS", os.path.join(_HERE, "downloads")
+)
+# How long an unanswered offer stays open, and how long the receiver keeps
+# its one-shot port open waiting for the sender to connect.
+TRANSFER_OFFER_TIMEOUT = 180
+TRANSFER_CONNECT_TIMEOUT = 60
+# Guard rails so a peer cannot exhaust server memory with bogus offers
+MAX_PENDING_OFFERS_PER_USER = 8
+FILENAME_MAX_LEN = 200
+
 # Client reconnect
 RECONNECT_BASE_DELAY = 1.0
 RECONNECT_MAX_DELAY = 30.0

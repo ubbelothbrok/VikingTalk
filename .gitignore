@@ -10,3 +10,6 @@ __pycache__/
 chat.db
 *.db-journal
 server.log
+
+# Files received from other devices
+downloads/

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import threading
+import time
 from typing import Any
 
 # Never crash on characters the local console can't display (e.g. emoji on a
@@ -35,11 +37,23 @@ except ImportError:  # pragma: no cover
 
 import config
 from discovery import find_servers
+from filetransfer import (
+    IncomingTransfer,
+    TransferError,
+    human_size,
+    new_transfer_id,
+    sanitize_filename,
+    send_file,
+)
 from protocol import (
     AUTH_REQUEST,
     AUTH_RESPONSE,
     CMD_REQUEST,
     CMD_RESPONSE,
+    FILE_ACCEPT,
+    FILE_DECLINE,
+    FILE_OFFER,
+    FILE_RESULT,
     HISTORY_RESPONSE,
     PING,
     PONG,
@@ -73,6 +87,12 @@ class ChatClient:
         self._write_lock = asyncio.Lock()
         self._stdin_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._reconnect_attempts = 0
+        # File transfers. Offers wait for the user; outgoing waits for an
+        # accept; incoming holds the live one-shot listeners.
+        self._offers: dict[str, dict[str, Any]] = {}
+        self._outgoing: dict[str, dict[str, Any]] = {}
+        self._incoming: dict[str, IncomingTransfer] = {}
+        self._send_tasks: set[asyncio.Task] = set()
 
     # --- Display ---
 
@@ -89,6 +109,7 @@ class ChatClient:
             "other": Fore.WHITE,
             "error": Fore.RED,
             "history": Fore.MAGENTA,
+            "file": Fore.MAGENTA,
         }
         color = colors.get(kind, Fore.WHITE)
         return f"{color}{text}{Style.RESET_ALL}"
@@ -195,6 +216,7 @@ class ChatClient:
             if self.running and was_connected:
                 await self._safe_print("Disconnected from server.", "error")
                 self.username = None
+                await self._cancel_all_transfers()
                 asyncio.create_task(self._reconnect_loop())
 
     async def _handle_server_message(self, msg: dict[str, Any]) -> None:
@@ -257,6 +279,27 @@ class ChatClient:
             await self._safe_print(line, "private")
             return
 
+        if msg_type == FILE_OFFER:
+            await self._on_file_offer(payload)
+            return
+
+        if msg_type == FILE_ACCEPT:
+            await self._on_file_accept(payload)
+            return
+
+        if msg_type == FILE_DECLINE:
+            await self._on_file_decline(payload)
+            return
+
+        if msg_type == FILE_RESULT:
+            ok = bool(payload.get("ok"))
+            await self._safe_print(
+                f"@{payload.get('from') or '?'}: {payload.get('message') or ''}",
+                "file" if ok else "error",
+            )
+            self._outgoing.pop(str(payload.get("transfer_id") or ""), None)
+            return
+
         if msg_type == HISTORY_RESPONSE:
             channel = payload.get("channel") or self.channel
             messages = payload.get("messages") or []
@@ -274,6 +317,336 @@ class ChatClient:
             return
 
         await self._safe_print(f"Unknown server message: {msg_type}", "error")
+
+    # --- File transfer ---
+    #
+    # The server only brokers: /send announces an offer, the recipient's
+    # /accept opens a one-shot port, and the bytes then flow straight from
+    # peer to peer -- never through the server, never through JSON frames.
+
+    def _print_soon(self, text: str, kind: str = "file") -> None:
+        """Print from a synchronous callback running on the event loop."""
+        task = asyncio.create_task(self._safe_print(text, kind))
+        self._send_tasks.add(task)
+        task.add_done_callback(self._send_tasks.discard)
+
+    def _progress_reporter(self, label: str):
+        """A throttled progress callback: one line a second, plus the last one."""
+        state = {"last": 0.0, "start": time.monotonic()}
+
+        def report(done: int, total: int) -> None:
+            now = time.monotonic()
+            if done < total and now - state["last"] < 1.0:
+                return
+            state["last"] = now
+            elapsed = max(now - state["start"], 1e-6)
+            pct = (done / total * 100) if total else 100.0
+            self._print_soon(
+                f"{label} {pct:5.1f}%  {human_size(done)} / {human_size(total)}"
+                f"  ({human_size(done / elapsed)}/s)"
+            )
+
+        return report
+
+    def _resolve_offer_id(self, args: list[str], verb: str) -> str | None:
+        """Pick the offer an /accept or /decline refers to (default: the only one)."""
+        if args:
+            transfer_id = args[0].lower()
+            if transfer_id in self._offers:
+                return transfer_id
+            self._print_soon(f"No pending offer '{transfer_id}'.", "error")
+            return None
+        if not self._offers:
+            self._print_soon("No incoming file offers.", "error")
+            return None
+        if len(self._offers) > 1:
+            self._print_soon(
+                f"Several offers pending; name one: /{verb} <id>  "
+                f"(ids: {', '.join(sorted(self._offers))})",
+                "error",
+            )
+            return None
+        return next(iter(self._offers))
+
+    async def _cmd_send_file(self, raw: str) -> None:
+        """/send <user> <path> -- paths may contain spaces and may be quoted."""
+        parts = raw.strip().split(None, 1)
+        if len(parts) < 2 or not parts[1].strip():
+            await self._safe_print("Error: usage /send <username> <path>", "error")
+            return
+        if not self.connected or not self.username:
+            await self._safe_print("Please /login first.", "error")
+            return
+
+        target = parts[0]
+        # A username never contains whitespace, so the whole tail is the path.
+        # Taking it raw keeps Windows backslashes intact (shlex would eat them).
+        raw_path = parts[1].strip()
+        for quote in ('"', "'"):
+            if len(raw_path) > 1 and raw_path[0] == quote and raw_path[-1] == quote:
+                raw_path = raw_path[1:-1]
+                break
+        path = os.path.abspath(os.path.expanduser(raw_path))
+        if not os.path.isfile(path):
+            await self._safe_print(f"Error: no such file: {path}", "error")
+            return
+        filename = sanitize_filename(os.path.basename(path))
+        if not filename:
+            await self._safe_print("Error: unusable file name.", "error")
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError as exc:
+            await self._safe_print(f"Error: cannot read file ({exc})", "error")
+            return
+        if size == 0:
+            await self._safe_print("Error: file is empty.", "error")
+            return
+        if size > config.MAX_FILE_SIZE:
+            await self._safe_print(
+                f"Error: file is {human_size(size)}; the limit is "
+                f"{human_size(config.MAX_FILE_SIZE)}.",
+                "error",
+            )
+            return
+
+        transfer_id = new_transfer_id()
+        self._outgoing[transfer_id] = {
+            "to": target,
+            "path": path,
+            "filename": filename,
+            "size": size,
+        }
+        try:
+            await self._send(
+                FILE_OFFER,
+                {
+                    "to": target,
+                    "transfer_id": transfer_id,
+                    "filename": filename,
+                    "size": size,
+                },
+            )
+        except Exception as exc:
+            self._outgoing.pop(transfer_id, None)
+            await self._safe_print(f"Send failed: {exc}", "error")
+
+    async def _cmd_accept(self, args: list[str]) -> None:
+        transfer_id = self._resolve_offer_id(args, "accept")
+        if transfer_id is None:
+            return
+        offer = self._offers.pop(transfer_id)
+
+        incoming = IncomingTransfer(
+            transfer_id=transfer_id,
+            sender=offer["from"],
+            filename=offer["filename"],
+            size=offer["size"],
+            dest_dir=config.DOWNLOADS_DIR,
+        )
+        try:
+            port = await incoming.start(
+                on_progress=self._progress_reporter(
+                    f"Receiving {offer['filename']}"
+                ),
+                on_done=lambda ok, message, path, tid=transfer_id: self._on_receive_done(
+                    tid, ok, message, path
+                ),
+            )
+        except OSError as exc:
+            await self._safe_print(f"Could not open a port to receive: {exc}", "error")
+            return
+
+        self._incoming[transfer_id] = incoming
+        try:
+            await self._send(
+                FILE_ACCEPT,
+                {"transfer_id": transfer_id, "port": port, "token": incoming.token},
+            )
+        except Exception as exc:
+            await incoming.close()
+            self._incoming.pop(transfer_id, None)
+            await self._safe_print(f"Send failed: {exc}", "error")
+            return
+        await self._safe_print(
+            f"Accepted '{offer['filename']}' -- waiting for @{offer['from']} "
+            f"to connect on port {port}…",
+            "file",
+        )
+
+    async def _cmd_decline(self, args: list[str]) -> None:
+        transfer_id = self._resolve_offer_id(args, "decline")
+        if transfer_id is None:
+            return
+        self._offers.pop(transfer_id, None)
+        try:
+            await self._send(FILE_DECLINE, {"transfer_id": transfer_id})
+        except Exception as exc:
+            await self._safe_print(f"Send failed: {exc}", "error")
+
+    async def _cmd_transfers(self) -> None:
+        lines: list[str] = []
+        for tid, offer in sorted(self._offers.items()):
+            lines.append(
+                f"  [{tid}] incoming  '{offer['filename']}' "
+                f"({human_size(offer['size'])}) from @{offer['from']}  "
+                f"-- /accept {tid} or /decline {tid}"
+            )
+        for tid, out in sorted(self._outgoing.items()):
+            lines.append(
+                f"  [{tid}] outgoing  '{out['filename']}' "
+                f"({human_size(out['size'])}) to @{out['to']}  -- waiting"
+            )
+        for tid, inc in sorted(self._incoming.items()):
+            lines.append(
+                f"  [{tid}] receiving '{inc.filename}' "
+                f"({human_size(inc.size)}) from @{inc.sender}"
+            )
+        body = "Transfers:\n" + ("\n".join(lines) if lines else "  (none)")
+        await self._safe_print(body, "file")
+
+    async def _on_file_offer(self, payload: dict[str, Any]) -> None:
+        transfer_id = str(payload.get("transfer_id") or "")
+        filename = sanitize_filename(str(payload.get("filename") or ""))
+        sender = str(payload.get("from") or "?")
+        try:
+            size = int(payload.get("size"))
+        except (TypeError, ValueError):
+            return
+        if not transfer_id or not filename:
+            return
+        self._offers[transfer_id] = {
+            "from": sender,
+            "filename": filename,
+            "size": size,
+        }
+        await self._safe_print(
+            f"@{sender} wants to send you '{filename}' ({human_size(size)}).  "
+            f"/accept {transfer_id}  or  /decline {transfer_id}",
+            "file",
+        )
+
+    async def _on_file_accept(self, payload: dict[str, Any]) -> None:
+        transfer_id = str(payload.get("transfer_id") or "")
+        out = self._outgoing.get(transfer_id)
+        if out is None:
+            return
+        host = str(payload.get("host") or "")
+        token = str(payload.get("token") or "")
+        try:
+            port = int(payload.get("port"))
+        except (TypeError, ValueError):
+            port = 0
+        if not host or not token or not 0 < port <= 65535:
+            await self._safe_print(
+                f"Transfer {transfer_id}: the recipient sent an unusable address.",
+                "error",
+            )
+            self._outgoing.pop(transfer_id, None)
+            return
+
+        await self._safe_print(
+            f"@{payload.get('from')} accepted '{out['filename']}'. "
+            f"Sending directly to {host}:{port}…",
+            "file",
+        )
+        task = asyncio.create_task(
+            self._run_send(transfer_id, host, port, token, out)
+        )
+        self._send_tasks.add(task)
+        task.add_done_callback(self._send_tasks.discard)
+
+    async def _on_file_decline(self, payload: dict[str, Any]) -> None:
+        transfer_id = str(payload.get("transfer_id") or "")
+        filename = payload.get("filename") or "file"
+        reason = payload.get("reason")
+        who = payload.get("from") or "?"
+        was_mine = self._outgoing.pop(transfer_id, None) is not None
+        incoming = self._incoming.pop(transfer_id, None)
+        was_offer = self._offers.pop(transfer_id, None) is not None
+        if incoming is not None:
+            await incoming.close()
+        detail = f" ({reason})" if reason else ""
+        if was_mine and not reason:
+            text = f"@{who} declined '{filename}'."
+        elif was_mine:
+            text = f"Sending '{filename}' to @{who} was cancelled{detail}."
+        elif was_offer or incoming is not None:
+            text = f"Incoming '{filename}' from @{who} was cancelled{detail}."
+        else:
+            text = f"Transfer of '{filename}' was cancelled{detail}."
+        await self._safe_print(text, "error")
+
+    async def _run_send(
+        self,
+        transfer_id: str,
+        host: str,
+        port: int,
+        token: str,
+        out: dict[str, Any],
+    ) -> None:
+        try:
+            await send_file(
+                host=host,
+                port=port,
+                transfer_id=transfer_id,
+                token=token,
+                path=out["path"],
+                size=out["size"],
+                progress=self._progress_reporter(f"Sending {out['filename']}"),
+            )
+            await self._safe_print(
+                f"Sent '{out['filename']}' ({human_size(out['size'])}) "
+                f"to @{out['to']}. Waiting for their confirmation…",
+                "file",
+            )
+        except (TransferError, OSError) as exc:
+            self._outgoing.pop(transfer_id, None)
+            await self._safe_print(
+                f"Could not send '{out['filename']}': {exc}", "error"
+            )
+        except asyncio.CancelledError:
+            raise
+
+    def _on_receive_done(
+        self, transfer_id: str, ok: bool, message: str, path: str | None
+    ) -> None:
+        """Called from the receiver when a transfer ends, for better or worse."""
+        incoming = self._incoming.pop(transfer_id, None)
+        self._print_soon(
+            f"{message} -> {path}" if ok and path else message,
+            "file" if ok else "error",
+        )
+        if incoming is not None and self.connected and self.username:
+            task = asyncio.create_task(
+                self._report_result(transfer_id, incoming.sender, ok, message)
+            )
+            self._send_tasks.add(task)
+            task.add_done_callback(self._send_tasks.discard)
+
+    async def _report_result(
+        self, transfer_id: str, sender: str, ok: bool, message: str
+    ) -> None:
+        """Tell the sender how it went, through the server."""
+        try:
+            await self._send(
+                FILE_RESULT,
+                {
+                    "transfer_id": transfer_id,
+                    "to": sender,
+                    "ok": ok,
+                    "message": message,
+                },
+            )
+        except Exception:
+            pass
+
+    async def _cancel_all_transfers(self) -> None:
+        for incoming in list(self._incoming.values()):
+            await incoming.close()
+        self._incoming.clear()
+        self._offers.clear()
+        self._outgoing.clear()
 
     # --- Input ---
 
@@ -387,8 +760,26 @@ class ChatClient:
         cmd = parts[0].lower().lstrip("/")
         args = parts[1:]
 
+        if cmd == "send":
+            # Keep the tail raw; a path may contain spaces or quotes.
+            await self._cmd_send_file(line.split(maxsplit=1)[1] if len(parts) > 1 else "")
+            return
+
+        if cmd == "accept":
+            await self._cmd_accept(args)
+            return
+
+        if cmd == "decline":
+            await self._cmd_decline(args)
+            return
+
+        if cmd == "transfers":
+            await self._cmd_transfers()
+            return
+
         if cmd == "quit":
             self.running = False
+            await self._cancel_all_transfers()
             await self.disconnect(send_logout=True)
             await self._safe_print("Goodbye.", "system")
             return
@@ -407,6 +798,10 @@ class ChatClient:
                 "  /login <user> <pass>     Log in\n"
                 "  /logout                  Log out\n"
                 "  /msg <user> <text>       Private message\n"
+                "  /send <user> <path>      Send a file directly over the LAN\n"
+                "  /accept [id]             Accept an incoming file\n"
+                "  /decline [id]            Decline an incoming file\n"
+                "  /transfers               List pending/active transfers\n"
                 "  /create <channel>        Create channel\n"
                 "  /join <channel>          Join channel\n"
                 "  /leave                   Leave to #general\n"

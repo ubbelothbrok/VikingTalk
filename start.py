@@ -210,6 +210,9 @@ def cmd_test():
         code = run_in_venv(["test_concurrent.py"], env=env)
     finally:
         stop_process(server)
+    say("Checking peer-to-peer file transfer ...")
+    # Needs no server: the transfer path is a direct socket between peers.
+    code = run_in_venv(["test_filetransfer.py"], env=env) or code
     say("Self-test %s." % ("PASSED" if code == 0 else "FAILED"))
     return code
 
