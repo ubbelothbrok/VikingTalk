@@ -368,3 +368,4 @@ file only once — hashing happens as the bytes go out.
 ## License
 
 Use and modify freely for learning and local development.
+
