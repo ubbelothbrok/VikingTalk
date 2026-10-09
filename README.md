@@ -40,7 +40,7 @@ cd CLI_chatting
 
 | OS | Command |
 |----|---------|
-| **Windows** | `start.bat` (or double-click `start.bat` in Explorer) |
+| **Windows** | `./start.bat` (or double-click `start.bat` in Explorer) |
 | **macOS** | `./start.sh` (or double-click `start.command` in Finder) |
 | **Linux** | `./start.sh` |
 
